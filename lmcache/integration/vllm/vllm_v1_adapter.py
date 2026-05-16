@@ -58,6 +58,53 @@ if TYPE_CHECKING:
 logger = init_logger(__name__)
 
 
+# Putpocket special mode is deliberately opt-in. When this config is absent,
+# LMCache follows the upstream lookup/retrieve path and never imports Putpocket.
+PUTPOCKET_SPECIAL_BLENDING_MODE = "special"
+
+
+def get_putpocket_blending_mode(config: LMCacheEngineConfig) -> Optional[str]:
+    """Return the optional Putpocket blending mode from LMCache extra config."""
+    extra_config = getattr(config, "extra_config", None)
+    if isinstance(extra_config, dict):
+        mode = extra_config.get("putpocket_blending_mode")
+    else:
+        mode = None
+
+    if mode is None:
+        blending_mode = None
+    else:
+        blending_mode = str(mode)
+    return blending_mode
+
+
+def build_putpocket_lmcache_executor() -> Any:
+    """Build the Putpocket executor only when the special hook is enabled."""
+    # Keep the import lazy so plain LMCache runs do not require the Putpocket
+    # package or its experimental dependencies to be installed.
+    try:
+        from putpocket.src.kv_update.lmcache_executor import (  # noqa: PLC0415
+            PutpocketLMCacheExecutor,
+        )
+    except ImportError as exc:
+        raise RuntimeError(
+            "Putpocket special blending mode requires the putpocket package "
+            "to be importable. Install it with `pip install -e ./putpocket`."
+        ) from exc
+
+    executor = PutpocketLMCacheExecutor()
+    return executor
+
+
+def get_is_putpocket_request(request_configs: Optional[dict]) -> bool:
+    """Return whether this request explicitly opts into Putpocket handling."""
+    if request_configs is None:
+        is_putpocket_request = False
+    else:
+        is_putpocket_request = bool(request_configs.get("putpocket.enable", False))
+    return is_putpocket_request
+
+
 @dataclass
 class LoadSpec:
     # Number of tokens cached in vLLM
@@ -66,6 +113,10 @@ class LoadSpec:
     lmcache_cached_tokens: int
     # Whether the scheduler allow us to load the tokens
     can_load: bool
+    # Scheduler-side Putpocket plan. It is attached here because the scheduler
+    # decides reuse eligibility, while the worker later needs the same plan when
+    # KV tensors and slot_mapping are available.
+    putpocket_plan: Optional[dict[str, Any]] = None
 
 
 @dataclass
@@ -95,7 +146,10 @@ def extract_request_configs(sampling_params: SamplingParams) -> Optional[dict]:
     if sampling_params and sampling_params.extra_args is not None:
         if kv_transfer_params := sampling_params.extra_args.get("kv_transfer_params"):
             for k, v in kv_transfer_params.items():
-                if k.startswith("lmcache."):
+                # Keep Putpocket metadata on the same per-request path as
+                # LMCache options until Putpocket has a typed request channel.
+                # This carries old tokens, edit spans, and algorithm knobs.
+                if k.startswith("lmcache.") or k.startswith("putpocket."):
                     if request_configs is None:
                         request_configs = {}
                     request_configs[k] = v
@@ -515,6 +569,14 @@ class LMCacheConnectorV1Impl:
         ] = {}
         self._stats_monitor = LMCStatsMonitor.GetOrCreate()
 
+        # Both roles need this flag: the scheduler builds the reuse plan, while
+        # the worker consumes it at the load/blend hook.
+        self.putpocket_blending_mode = get_putpocket_blending_mode(config)
+        if self.putpocket_blending_mode == PUTPOCKET_SPECIAL_BLENDING_MODE:
+            self.putpocket_executor = build_putpocket_lmcache_executor()
+        else:
+            self.putpocket_executor = None
+
         # Role-specific initialization
         if role == KVConnectorRole.SCHEDULER:
             self._unfinished_requests: dict[str, "Request"] = {}
@@ -813,14 +875,42 @@ class LMCacheConnectorV1Impl:
                     sync = False
                 # NOTE(Jiayi): Perform blending before layerwise prefix caching
                 if self.enable_blending:
-                    # TODO(Jiayi): Need to make prefix caching and blending compatible
-                    self.blender.blend(
-                        tokens[:lmcache_cached_tokens],
-                        token_mask[:lmcache_cached_tokens],
-                        kvcaches=kvcaches,
-                        slot_mapping=slot_mapping[:lmcache_cached_tokens],
-                        vllm_cached_tokens=request.load_spec.vllm_cached_tokens,
-                    )
+                    if request.load_spec.putpocket_plan is not None:
+                        # Execution hook. The scheduler stored putpocket_plan in
+                        # LoadSpec; here vLLM has allocated slots and the worker
+                        # can update/load real KV tensors.
+                        assert self.putpocket_executor is not None
+                        handled_by_putpocket = self.putpocket_executor.apply_plan(
+                            plan=request.load_spec.putpocket_plan,
+                            tokens=tokens[:lmcache_cached_tokens],
+                            token_mask=token_mask[:lmcache_cached_tokens],
+                            kvcaches=kvcaches,
+                            slot_mapping=slot_mapping[:lmcache_cached_tokens],
+                            vllm_cached_tokens=request.load_spec.vllm_cached_tokens,
+                            request_configs=request.request_configs,
+                            req_id=request.req_id,
+                        )
+                        # The initial executor is intentionally dry-run only.
+                        # Fail closed so special mode cannot silently fall back
+                        # to an unverified KV reuse path.
+                        if not handled_by_putpocket:
+                            raise NotImplementedError(
+                                "Putpocket special blending hook reached, but the "
+                                "current Putpocket executor is dry-run only. Add "
+                                "the KV tensor update implementation before "
+                                "enabling putpocket_blending_mode=special."
+                            )
+                        else:
+                            pass
+                    else:
+                        # TODO(Jiayi): Need to make prefix caching and blending compatible
+                        self.blender.blend(
+                            tokens[:lmcache_cached_tokens],
+                            token_mask[:lmcache_cached_tokens],
+                            kvcaches=kvcaches,
+                            slot_mapping=slot_mapping[:lmcache_cached_tokens],
+                            vllm_cached_tokens=request.load_spec.vllm_cached_tokens,
+                        )
                 else:
                     layerwise_retriever = self.lmcache_engine.retrieve_layer(
                         tokens[:lmcache_cached_tokens],
@@ -1250,6 +1340,10 @@ class LMCacheConnectorV1Impl:
         # lookup_client is always initialized for scheduler role
         assert self.lookup_client is not None
 
+        # Putpocket needs more than a hit-token count, so this scheduler-side
+        # plan is copied into LoadSpec for later worker-side execution.
+        putpocket_plan = None
+
         if (
             num_external_hit_tokens := self.lookup_client.lookup_cache(lookup_id=req_id)
         ) != -1:
@@ -1279,11 +1373,41 @@ class LMCacheConnectorV1Impl:
             if self.skip_last_n_tokens > 0:
                 token_ids = token_ids[: -self.skip_last_n_tokens]
 
-            num_external_hit_tokens = self.lookup_client.lookup(
-                token_ids,
-                lookup_id=req_id,
-                request_configs=request_configs,
-            )
+            if (
+                self.putpocket_blending_mode == PUTPOCKET_SPECIAL_BLENDING_MODE
+                and get_is_putpocket_request(request_configs)
+            ):
+                # Planning hook. No KV tensors are visible here; this can only
+                # estimate reuse and produce a serializable plan from request
+                # metadata carried through request_configs.
+                assert self.putpocket_executor is not None
+                putpocket_plan = self.putpocket_executor.build_plan_from_request_configs(
+                    request_id=req_id,
+                    new_token_ids=list(token_ids),
+                    request_configs=request_configs,
+                )
+                if putpocket_plan is None:
+                    # Missing or invalid Putpocket metadata means no external
+                    # cache hit, so fall back to the ordinary LMCache lookup.
+                    num_external_hit_tokens = self.lookup_client.lookup(
+                        token_ids,
+                        lookup_id=req_id,
+                        request_configs=request_configs,
+                    )
+                else:
+                    # First wiring step: reserve the planned prompt range as
+                    # externally provided. The worker executor is responsible
+                    # for making the exact load/correct/recompute policy real.
+                    num_external_hit_tokens = min(
+                        int(putpocket_plan["new_token_len"]),
+                        request.num_tokens,
+                    )
+            else:
+                num_external_hit_tokens = self.lookup_client.lookup(
+                    token_ids,
+                    lookup_id=req_id,
+                    request_configs=request_configs,
+                )
 
         if num_external_hit_tokens is None:
             logger.debug(
@@ -1334,10 +1458,14 @@ class LMCacheConnectorV1Impl:
                 max(need_to_allocate, 0),
             )
 
+        # Store the Putpocket plan while can_load=False. vLLM flips can_load
+        # after slot allocation, and build_connector_meta then carries this
+        # LoadSpec to the worker.
         self.load_specs[req_id] = LoadSpec(
             vllm_cached_tokens=num_computed_tokens,
             lmcache_cached_tokens=num_external_hit_tokens,
             can_load=False,
+            putpocket_plan=putpocket_plan,
         )
 
         if below_min_retrieve or need_to_allocate <= 0:
