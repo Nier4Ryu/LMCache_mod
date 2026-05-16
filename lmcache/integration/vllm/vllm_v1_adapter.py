@@ -78,12 +78,16 @@ def get_putpocket_blending_mode(config: LMCacheEngineConfig) -> Optional[str]:
     return blending_mode
 
 
-def build_putpocket_lmcache_executor() -> Any:
+def build_putpocket_lmcache_executor(
+    tensor_parallel_size: int,
+    pipeline_parallel_size: int,
+) -> Any:
     """Build the Putpocket executor only when the special hook is enabled."""
     # Keep the import lazy so plain LMCache runs do not require the Putpocket
     # package or its experimental dependencies to be installed.
     try:
         from putpocket.src.kv_update.lmcache_executor import (  # noqa: PLC0415
+            PutpocketParallelConfig,
             PutpocketLMCacheExecutor,
         )
     except ImportError as exc:
@@ -92,7 +96,11 @@ def build_putpocket_lmcache_executor() -> Any:
             "to be importable. Install it with `pip install -e ./putpocket`."
         ) from exc
 
-    executor = PutpocketLMCacheExecutor()
+    parallel_config = PutpocketParallelConfig(
+        tensor_parallel_size=tensor_parallel_size,
+        pipeline_parallel_size=pipeline_parallel_size,
+    )
+    executor = PutpocketLMCacheExecutor(parallel_config=parallel_config)
     return executor
 
 
@@ -573,7 +581,11 @@ class LMCacheConnectorV1Impl:
         # the worker consumes it at the load/blend hook.
         self.putpocket_blending_mode = get_putpocket_blending_mode(config)
         if self.putpocket_blending_mode == PUTPOCKET_SPECIAL_BLENDING_MODE:
-            self.putpocket_executor = build_putpocket_lmcache_executor()
+            parallel_config = vllm_config.parallel_config
+            self.putpocket_executor = build_putpocket_lmcache_executor(
+                tensor_parallel_size=parallel_config.tensor_parallel_size,
+                pipeline_parallel_size=parallel_config.pipeline_parallel_size,
+            )
         else:
             self.putpocket_executor = None
 
@@ -583,8 +595,12 @@ class LMCacheConnectorV1Impl:
         else:
             self.use_layerwise = config.use_layerwise
             self.enable_blending = config.enable_blending
+            self.blender = None
 
-            if self.enable_blending:
+            if (
+                self.enable_blending
+                and self.putpocket_blending_mode != PUTPOCKET_SPECIAL_BLENDING_MODE
+            ):
                 assert self.lmcache_engine is not None
                 assert self.lmcache_engine.gpu_connector is not None, (
                     "GPU connector must be available for blending"
@@ -874,43 +890,42 @@ class LMCacheConnectorV1Impl:
                 else:
                     sync = False
                 # NOTE(Jiayi): Perform blending before layerwise prefix caching
-                if self.enable_blending:
-                    if request.load_spec.putpocket_plan is not None:
-                        # Execution hook. The scheduler stored putpocket_plan in
-                        # LoadSpec; here vLLM has allocated slots and the worker
-                        # can update/load real KV tensors.
-                        assert self.putpocket_executor is not None
-                        handled_by_putpocket = self.putpocket_executor.apply_plan(
-                            plan=request.load_spec.putpocket_plan,
-                            tokens=tokens[:lmcache_cached_tokens],
-                            token_mask=token_mask[:lmcache_cached_tokens],
-                            kvcaches=kvcaches,
-                            slot_mapping=slot_mapping[:lmcache_cached_tokens],
-                            vllm_cached_tokens=request.load_spec.vllm_cached_tokens,
-                            request_configs=request.request_configs,
-                            req_id=request.req_id,
+                if request.load_spec.putpocket_plan is not None:
+                    # Execution hook. The scheduler stored putpocket_plan in
+                    # LoadSpec; here vLLM has allocated slots and the worker
+                    # can update/load real KV tensors.
+                    assert self.putpocket_executor is not None
+                    handled_by_putpocket = self.putpocket_executor.apply_plan(
+                        plan=request.load_spec.putpocket_plan,
+                        tokens=tokens[:lmcache_cached_tokens],
+                        token_mask=token_mask[:lmcache_cached_tokens],
+                        kvcaches=kvcaches,
+                        slot_mapping=slot_mapping[:lmcache_cached_tokens],
+                        vllm_cached_tokens=request.load_spec.vllm_cached_tokens,
+                        request_configs=request.request_configs,
+                        req_id=request.req_id,
+                    )
+                    # The initial executor is intentionally dry-run only.
+                    # Fail closed so special mode cannot silently fall back
+                    # to an unverified KV reuse path.
+                    if not handled_by_putpocket:
+                        raise NotImplementedError(
+                            "Putpocket special blending hook reached, but the "
+                            "current Putpocket executor is dry-run only. Add "
+                            "the KV tensor update implementation before "
+                            "enabling putpocket_blending_mode=special."
                         )
-                        # The initial executor is intentionally dry-run only.
-                        # Fail closed so special mode cannot silently fall back
-                        # to an unverified KV reuse path.
-                        if not handled_by_putpocket:
-                            raise NotImplementedError(
-                                "Putpocket special blending hook reached, but the "
-                                "current Putpocket executor is dry-run only. Add "
-                                "the KV tensor update implementation before "
-                                "enabling putpocket_blending_mode=special."
-                            )
-                        else:
-                            pass
                     else:
-                        # TODO(Jiayi): Need to make prefix caching and blending compatible
-                        self.blender.blend(
-                            tokens[:lmcache_cached_tokens],
-                            token_mask[:lmcache_cached_tokens],
-                            kvcaches=kvcaches,
-                            slot_mapping=slot_mapping[:lmcache_cached_tokens],
-                            vllm_cached_tokens=request.load_spec.vllm_cached_tokens,
-                        )
+                        pass
+                elif self.enable_blending and self.blender is not None:
+                    # TODO(Jiayi): Need to make prefix caching and blending compatible
+                    self.blender.blend(
+                        tokens[:lmcache_cached_tokens],
+                        token_mask[:lmcache_cached_tokens],
+                        kvcaches=kvcaches,
+                        slot_mapping=slot_mapping[:lmcache_cached_tokens],
+                        vllm_cached_tokens=request.load_spec.vllm_cached_tokens,
+                    )
                 else:
                     layerwise_retriever = self.lmcache_engine.retrieve_layer(
                         tokens[:lmcache_cached_tokens],
@@ -1372,6 +1387,7 @@ class LMCacheConnectorV1Impl:
             request_configs = extract_request_configs(request.sampling_params)
             if self.skip_last_n_tokens > 0:
                 token_ids = token_ids[: -self.skip_last_n_tokens]
+            token_ids = list(token_ids)
 
             if (
                 self.putpocket_blending_mode == PUTPOCKET_SPECIAL_BLENDING_MODE
@@ -1383,7 +1399,7 @@ class LMCacheConnectorV1Impl:
                 assert self.putpocket_executor is not None
                 putpocket_plan = self.putpocket_executor.build_plan_from_request_configs(
                     request_id=req_id,
-                    new_token_ids=list(token_ids),
+                    new_token_ids=token_ids,
                     request_configs=request_configs,
                 )
                 if putpocket_plan is None:
