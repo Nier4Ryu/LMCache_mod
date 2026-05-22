@@ -61,6 +61,8 @@ logger = init_logger(__name__)
 # Putpocket special mode is deliberately opt-in. When this config is absent,
 # LMCache follows the upstream lookup/retrieve path and never imports Putpocket.
 PUTPOCKET_SPECIAL_BLENDING_MODE = "special"
+PUTPOCKET_DEFAULT_EXECUTOR_NAME = "default"
+PUTPOCKET_QUERY_BASED_PPLE_EXECUTOR_NAME = "query_based_pple"
 
 
 def get_putpocket_blending_mode(config: LMCacheEngineConfig) -> Optional[str]:
@@ -78,9 +80,26 @@ def get_putpocket_blending_mode(config: LMCacheEngineConfig) -> Optional[str]:
     return blending_mode
 
 
+def get_putpocket_executor_name(config: LMCacheEngineConfig) -> str:
+    """Return which Putpocket executor special mode should instantiate."""
+    extra_config = getattr(config, "extra_config", None)
+    if isinstance(extra_config, dict):
+        name = extra_config.get("putpocket_executor")
+    else:
+        name = None
+
+    if name is None:
+        executor_name = PUTPOCKET_DEFAULT_EXECUTOR_NAME
+    else:
+        executor_name = str(name)
+    return executor_name
+
+
 def build_putpocket_lmcache_executor(
     tensor_parallel_size: int,
     pipeline_parallel_size: int,
+    executor_name: str = PUTPOCKET_DEFAULT_EXECUTOR_NAME,
+    runtime_config: Any | None = None,
 ) -> Any:
     """Build the Putpocket executor only when the special hook is enabled."""
     # Keep the import lazy so plain LMCache runs do not require the Putpocket
@@ -100,8 +119,70 @@ def build_putpocket_lmcache_executor(
         tensor_parallel_size=tensor_parallel_size,
         pipeline_parallel_size=pipeline_parallel_size,
     )
-    executor = PutpocketLMCacheExecutor(parallel_config=parallel_config)
+    if executor_name == PUTPOCKET_DEFAULT_EXECUTOR_NAME:
+        executor = PutpocketLMCacheExecutor(
+            parallel_config=parallel_config,
+            runtime_config=runtime_config,
+        )
+    elif executor_name == PUTPOCKET_QUERY_BASED_PPLE_EXECUTOR_NAME:
+        try:
+            from putpocket.src.kv_update.query_based_pple import (  # noqa: PLC0415
+                QueryBasedPPLE,
+            )
+        except ImportError as exc:
+            raise RuntimeError(
+                "Putpocket query_based_pple executor requires the putpocket "
+                "package to expose QueryBasedPPLE."
+            ) from exc
+        executor = QueryBasedPPLE(
+            parallel_config=parallel_config,
+            runtime_config=runtime_config,
+        )
+    else:
+        raise ValueError(f"Unknown Putpocket executor: {executor_name!r}")
     return executor
+
+
+def get_putpocket_lmcache_hit_token_len(
+    putpocket_plan: dict[str, Any],
+    request_num_tokens: int,
+) -> int:
+    """Return scheduler-visible hit tokens from a Putpocket plan."""
+    if "lmcache_hit_token_len" in putpocket_plan:
+        raw_hit_token_len = putpocket_plan["lmcache_hit_token_len"]
+    elif "reuse_until_new_idx" in putpocket_plan:
+        raw_hit_token_len = putpocket_plan["reuse_until_new_idx"]
+    else:
+        raw_hit_token_len = putpocket_plan["new_token_len"]
+
+    hit_token_len = min(int(raw_hit_token_len), request_num_tokens)
+    hit_token_len = max(0, hit_token_len)
+    return hit_token_len
+
+
+def advance_layerwise_storer_safely(
+    layerwise_storer: Generator,
+    req_id: str,
+    phase: str,
+) -> bool:
+    """Advance a layerwise store generator without surfacing exhaustion.
+
+    LMCache normally yields once per layer plus a final completion yield, but
+    partial-chunk storage can exhaust earlier. Treat that as completed rather
+    than crashing the vLLM worker; incomplete storage is still visible as a
+    later LMCache miss.
+    """
+    try:
+        next(layerwise_storer)
+        advanced = True
+    except StopIteration:
+        logger.debug(
+            "Layerwise storer already exhausted for request %s during %s",
+            req_id,
+            phase,
+        )
+        advanced = False
+    return advanced
 
 
 def get_is_putpocket_request(request_configs: Optional[dict]) -> bool:
@@ -111,6 +192,15 @@ def get_is_putpocket_request(request_configs: Optional[dict]) -> bool:
     else:
         is_putpocket_request = bool(request_configs.get("putpocket.enable", False))
     return is_putpocket_request
+
+
+def get_is_putpocket_profile_only_request(request_configs: Optional[dict]) -> bool:
+    """Return whether Putpocket should profile a request without KV override."""
+    if request_configs is None:
+        is_profile_only = False
+    else:
+        is_profile_only = bool(request_configs.get("putpocket.profile_only", False))
+    return is_profile_only
 
 
 @dataclass
@@ -337,6 +427,11 @@ class ReqMeta:
     req_id: str
     # Request tokens
     token_ids: list[int]  # torch.Tensor
+    # Number of prompt tokens represented after the current scheduler step.
+    # This may be larger than len(token_ids) when save metadata discards a
+    # partial LMCache chunk, so attention replay uses it to recover the
+    # absolute token offset of the local query tensor.
+    input_token_len: int
     # Slot mapping
     slot_mapping: torch.Tensor
 
@@ -478,6 +573,7 @@ class ReqMeta:
         return ReqMeta(
             req_id=tracker.req_id,
             token_ids=token_ids,
+            input_token_len=input_token_len,
             slot_mapping=slot_mapping,
             is_last_prefill=is_last_prefill,
             save_spec=save_spec,
@@ -585,6 +681,8 @@ class LMCacheConnectorV1Impl:
             self.putpocket_executor = build_putpocket_lmcache_executor(
                 tensor_parallel_size=parallel_config.tensor_parallel_size,
                 pipeline_parallel_size=parallel_config.pipeline_parallel_size,
+                executor_name=get_putpocket_executor_name(config),
+                runtime_config=vllm_config,
             )
         else:
             self.putpocket_executor = None
@@ -897,6 +995,7 @@ class LMCacheConnectorV1Impl:
                     assert self.putpocket_executor is not None
                     handled_by_putpocket = self.putpocket_executor.apply_plan(
                         plan=request.load_spec.putpocket_plan,
+                        lmcache_engine=self.lmcache_engine,
                         tokens=tokens[:lmcache_cached_tokens],
                         token_mask=token_mask[:lmcache_cached_tokens],
                         kvcaches=kvcaches,
@@ -904,16 +1003,16 @@ class LMCacheConnectorV1Impl:
                         vllm_cached_tokens=request.load_spec.vllm_cached_tokens,
                         request_configs=request.request_configs,
                         req_id=request.req_id,
+                        sync=sync,
                     )
-                    # The initial executor is intentionally dry-run only.
                     # Fail closed so special mode cannot silently fall back
-                    # to an unverified KV reuse path.
+                    # after the scheduler reserved external KV tokens.
                     if not handled_by_putpocket:
                         raise NotImplementedError(
                             "Putpocket special blending hook reached, but the "
-                            "current Putpocket executor is dry-run only. Add "
-                            "the KV tensor update implementation before "
-                            "enabling putpocket_blending_mode=special."
+                            "current executor did not materialize the reserved "
+                            "KV tokens. Check source tags/token metadata before "
+                            "enabling this request."
                         )
                     else:
                         pass
@@ -933,7 +1032,13 @@ class LMCacheConnectorV1Impl:
                         kvcaches=kvcaches,
                         slot_mapping=slot_mapping[:lmcache_cached_tokens],
                         vllm_cached_tokens=request.load_spec.vllm_cached_tokens,
+                        request_configs=request.request_configs,
+                        putpocket_disable_position_remap=(
+                            self.putpocket_blending_mode
+                            == PUTPOCKET_SPECIAL_BLENDING_MODE
+                        ),
                         sync=sync,
+                        req_id=request.req_id,
                     )
                     # NOTE: retrieve for two layers at the first layer
                     next(layerwise_retriever)
@@ -1124,19 +1229,45 @@ class LMCacheConnectorV1Impl:
                 save_spec is None or not save_spec.can_save
             ) and self.kv_role != "kv_producer":
                 continue
+            request_configs = request.request_configs
 
             layerwise_storer = self._layerwise_save_storers.get(request.req_id)
+            token_ids = request.token_ids
+            assert isinstance(token_ids, list)
+
+            slot_mapping = request.slot_mapping
+            assert isinstance(slot_mapping, torch.Tensor)
+            assert len(slot_mapping) == len(token_ids)
+
+            # TODO: have a pre-allocated buffer to hold the slot_mappings
+            slot_mapping = slot_mapping.to(self.device)
+
+            if (
+                isinstance(request_configs, dict)
+                and request_configs.get("putpocket.kv_vector_dump.enable", False)
+            ):
+                try:
+                    from putpocket.src.kv_update.vllm_kv_vector_dump import (  # noqa: PLC0415
+                        maybe_dump_vllm_kv_layer_vectors,
+                    )
+
+                    maybe_dump_vllm_kv_layer_vectors(
+                        layer_name=layer_name,
+                        kv_layer=kv_layer,
+                        token_ids=token_ids,
+                        slot_mapping=slot_mapping,
+                        request_configs=request_configs,
+                        req_id=request.req_id,
+                    )
+                except Exception:
+                    logger.exception(
+                        "Putpocket KV vector dump failed for request %s layer %s",
+                        request.req_id,
+                        layer_name,
+                    )
+                continue
+
             if layerwise_storer is None:
-                token_ids = request.token_ids
-                assert isinstance(token_ids, list)
-
-                slot_mapping = request.slot_mapping
-                assert isinstance(slot_mapping, torch.Tensor)
-                assert len(slot_mapping) == len(token_ids)
-
-                # TODO: have a pre-allocated buffer to hold the slot_mappings
-                slot_mapping = slot_mapping.to(self.device)
-
                 if self.kv_role == "kv_producer":
                     skip_leading_tokens = 0
                 else:
@@ -1172,6 +1303,7 @@ class LMCacheConnectorV1Impl:
                     kvcaches=kvcaches,
                     slot_mapping=slot_mapping,
                     offset=skip_leading_tokens,
+                    request_configs=request.request_configs,
                     sync=is_first,
                     req_id=request.req_id,
                 )
@@ -1179,7 +1311,90 @@ class LMCacheConnectorV1Impl:
                 if is_first:
                     is_first = False
 
-            next(layerwise_storer)
+            advanced = advance_layerwise_storer_safely(
+                layerwise_storer=layerwise_storer,
+                req_id=request.req_id,
+                phase="save_kv_layer",
+            )
+            if advanced:
+                pass
+            else:
+                self._layerwise_save_storers.pop(request.req_id, None)
+
+    @_lmcache_nvtx_annotate
+    def capture_putpocket_attention_layer(
+        self,
+        layer_name: str,
+        query: torch.Tensor,
+        key: torch.Tensor | None,
+        kv_cache: torch.Tensor,
+        attn_metadata: "AttentionMetadata",
+        **kwargs,
+    ) -> None:
+        """Capture replay attention scores for opted-in Putpocket requests."""
+        if self.putpocket_executor is None:
+            pass
+        elif self._parent._connector_metadata is None:
+            pass
+        elif query is None:
+            pass
+        else:
+            connector_metadata = self._parent._get_connector_metadata()
+            assert isinstance(connector_metadata, LMCacheConnectorMetadata)
+            attn_query_start_loc = getattr(attn_metadata, "query_start_loc", None)
+
+            for request_index, request in enumerate(connector_metadata.requests):
+                slot_mapping = request.slot_mapping
+                assert isinstance(slot_mapping, torch.Tensor)
+                slot_mapping = slot_mapping.to(self.device)
+                request_query = self._get_putpocket_request_query_slice(
+                    query=query,
+                    query_start_loc=attn_query_start_loc,
+                    request_index=request_index,
+                )
+                if key is None:
+                    request_key = None
+                else:
+                    request_key = self._get_putpocket_request_query_slice(
+                        query=key,
+                        query_start_loc=attn_query_start_loc,
+                        request_index=request_index,
+                    )
+                query_token_offset = max(
+                    0,
+                    int(request.input_token_len) - int(request_query.shape[0]),
+                )
+                local_token_span = (
+                    query_token_offset,
+                    query_token_offset + int(request_query.shape[0]),
+                )
+                self.putpocket_executor.capture_layer_attention(
+                    request_id=request.req_id,
+                    request_configs=request.request_configs,
+                    layer_name=layer_name,
+                    query=request_query,
+                    key=request_key,
+                    kv_cache=kv_cache,
+                    slot_mapping=slot_mapping,
+                    query_token_offset=query_token_offset,
+                    local_token_span=local_token_span,
+                )
+
+    def _get_putpocket_request_query_slice(
+        self,
+        query: torch.Tensor,
+        query_start_loc: torch.Tensor | None,
+        request_index: int,
+    ) -> torch.Tensor:
+        if query_start_loc is None:
+            request_query = query
+        elif request_index + 1 >= query_start_loc.shape[0]:
+            request_query = query
+        else:
+            start = int(query_start_loc[request_index].item())
+            end = int(query_start_loc[request_index + 1].item())
+            request_query = query[start:end]
+        return request_query
 
     @_lmcache_nvtx_annotate
     def wait_for_save(self):
@@ -1206,7 +1421,13 @@ class LMCacheConnectorV1Impl:
                     request.req_id, None
                 )
                 if layerwise_storer is not None:
-                    next(layerwise_storer)
+                    advance_layerwise_storer_safely(
+                        layerwise_storer=layerwise_storer,
+                        req_id=request.req_id,
+                        phase="wait_for_save",
+                    )
+                else:
+                    pass
                 # unpin the kv caches according to req_id
                 self.lmcache_engine.lookup_unpin(request.req_id)
             return
@@ -1364,6 +1585,12 @@ class LMCacheConnectorV1Impl:
         ) != -1:
             # -1 means no result cached
             # None or int means ongoing (async) or cached result
+            cached_load_spec = self.load_specs.get(req_id)
+            if cached_load_spec is None:
+                pass
+            else:
+                num_external_hit_tokens = cached_load_spec.lmcache_cached_tokens
+                putpocket_plan = cached_load_spec.putpocket_plan
             logger.debug(
                 f"Found {num_external_hit_tokens} hit tokens for request"
                 f" {req_id} in the lookup cache."
@@ -1393,31 +1620,54 @@ class LMCacheConnectorV1Impl:
                 self.putpocket_blending_mode == PUTPOCKET_SPECIAL_BLENDING_MODE
                 and get_is_putpocket_request(request_configs)
             ):
-                # Planning hook. No KV tensors are visible here; this can only
-                # estimate reuse and produce a serializable plan from request
-                # metadata carried through request_configs.
-                assert self.putpocket_executor is not None
-                putpocket_plan = self.putpocket_executor.build_plan_from_request_configs(
-                    request_id=req_id,
-                    new_token_ids=token_ids,
+                exact_hit_tokens = self.lookup_client.lookup(
+                    token_ids,
+                    lookup_id=req_id,
                     request_configs=request_configs,
                 )
-                if putpocket_plan is None:
-                    # Missing or invalid Putpocket metadata means no external
-                    # cache hit, so fall back to the ordinary LMCache lookup.
-                    num_external_hit_tokens = self.lookup_client.lookup(
-                        token_ids,
-                        lookup_id=req_id,
-                        request_configs=request_configs,
+                if exact_hit_tokens is None:
+                    num_external_hit_tokens = None
+                elif exact_hit_tokens > num_computed_tokens:
+                    # Target exact match wins. This keeps already-materialized
+                    # Putpocket variants on the normal LMCache retrieve path.
+                    putpocket_plan = None
+                    num_external_hit_tokens = exact_hit_tokens
+                    logger.info(
+                        "Putpocket target exact hit for request %s: %d tokens",
+                        req_id,
+                        exact_hit_tokens,
                     )
                 else:
-                    # First wiring step: reserve the planned prompt range as
-                    # externally provided. The worker executor is responsible
-                    # for making the exact load/correct/recompute policy real.
-                    num_external_hit_tokens = min(
-                        int(putpocket_plan["new_token_len"]),
-                        request.num_tokens,
+                    # Planning hook. No KV tensors are visible here; this can only
+                    # estimate source reuse and produce a serializable plan from
+                    # request metadata carried through request_configs.
+                    assert self.putpocket_executor is not None
+                    putpocket_plan = (
+                        self.putpocket_executor.build_plan_from_request_configs(
+                            request_id=req_id,
+                            new_token_ids=token_ids,
+                            request_configs=request_configs,
+                        )
                     )
+                    if (
+                        putpocket_plan is None
+                        or get_is_putpocket_profile_only_request(request_configs)
+                    ):
+                        # Missing or invalid Putpocket metadata means no external
+                        # cache hit. Profile-only mode keeps the plan visible to
+                        # the caller's own logs but deliberately avoids attaching a
+                        # worker LoadSpec plan.
+                        putpocket_plan = None
+                        num_external_hit_tokens = exact_hit_tokens
+                    else:
+                        # Reserve only the runtime-safe source prefix. The worker
+                        # executor loads that prefix from the source namespace; vLLM
+                        # computes the remainder and normal LMCache save persists
+                        # the target-tagged result.
+                        num_external_hit_tokens = get_putpocket_lmcache_hit_token_len(
+                            putpocket_plan,
+                            request.num_tokens,
+                        )
             else:
                 num_external_hit_tokens = self.lookup_client.lookup(
                     token_ids,

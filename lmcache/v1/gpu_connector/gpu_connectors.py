@@ -771,7 +771,11 @@ class VLLMBufferLayerwiseGPUConnector(GPUConnectorInterface):
         if "slot_mapping" not in kwargs:
             raise ValueError("'slot_mapping' should be provided in kwargs.")
 
-        if self.fused_rotary_emb is None and self.cache_positions:
+        cache_positions = self.cache_positions and not bool(
+            kwargs.get("putpocket_disable_position_remap", False)
+        )
+
+        if self.fused_rotary_emb is None and cache_positions:
             # TODO(Jiayi): Make this more elegant
             # First Party
             from lmcache.integration.vllm.utils import ENGINE_NAME
@@ -798,7 +802,7 @@ class VLLMBufferLayerwiseGPUConnector(GPUConnectorInterface):
         self.current_gap_positions = torch.where(gap_mask)[0]
 
         buf_offset = starts[0]
-        if self.cache_positions:
+        if cache_positions:
             new_positions_full = torch.arange(
                 starts[0], ends[-1], dtype=torch.int64, device=self.kvcaches[0].device
             )
@@ -822,7 +826,7 @@ class VLLMBufferLayerwiseGPUConnector(GPUConnectorInterface):
 
         # current_stream = torch.cuda.current_stream()
 
-        if self.cache_positions:
+        if cache_positions:
             old_positions_full = torch.zeros(
                 (num_all_tokens,), dtype=torch.int64, device=self.kvcaches[0].device
             )
@@ -850,7 +854,7 @@ class VLLMBufferLayerwiseGPUConnector(GPUConnectorInterface):
                     compute_gpu_buffer_obj,
                 )
 
-                if self.cache_positions:
+                if cache_positions:
                     assert compute_gpu_buffer_obj.tensor is not None
 
                     compute_gpu_buffer_obj.tensor[0] = self.fused_rotary_emb(
@@ -885,7 +889,7 @@ class VLLMBufferLayerwiseGPUConnector(GPUConnectorInterface):
                             start - buf_offset : end - buf_offset
                         ].copy_(memory_obj.tensor[1], non_blocking=True)
 
-                        if self.cache_positions and layer_id == 0:
+                        if cache_positions and layer_id == 0:
                             old_positions_full[
                                 start - buf_offset : end - buf_offset
                             ] = memory_obj.metadata.cached_positions

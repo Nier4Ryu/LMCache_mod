@@ -992,6 +992,12 @@ class LMCacheEngine:
         if keys:
             # Transpose the keys into layer major format
             keys_layer_major = [list(row) for row in zip(*keys, strict=False)]
+            request_pinned_memory_obj_ids = (
+                self._get_layerwise_request_pinned_memory_obj_ids(
+                    req_id=req_id,
+                    location=location,
+                )
+            )
 
             get_generator = self.storage_manager.layerwise_batched_get(
                 keys_layer_major,
@@ -1038,8 +1044,14 @@ class LMCacheEngine:
         # Without this, pin_count stays at 1 forever and the CPU staging pool
         # fills up, causing the next retrieve to deadlock inside allocate().
         for mem_obj in to_count_down:
-            if mem_obj.is_pinned:
+            if id(mem_obj) in request_pinned_memory_obj_ids:
+                # This pin is owned by lookup(pin=True) and must be released
+                # exactly once by lookup_unpin(req_id) at request finalization.
+                pass
+            elif mem_obj.is_pinned:
                 mem_obj.unpin()
+            else:
+                pass
 
         retrieved_tokens = torch.sum(ret_mask)
         self.stats_monitor.on_retrieve_finished(monitor_req_id, retrieved_tokens)
@@ -1053,6 +1065,42 @@ class LMCacheEngine:
             )
 
         yield ret_mask
+
+    def _get_layerwise_request_pinned_memory_obj_ids(
+        self,
+        req_id: str,
+        location: Optional[str],
+    ) -> set[int]:
+        """Return LocalCPU MemoryObj ids whose pin is owned by lookup_unpin.
+
+        Layerwise retrieve also sees disk-loaded staging objects that are pinned
+        by retrieve itself; those must still be unpinned inside retrieve_layer.
+        The LocalCPU exact-hit case is different: lookup(pin=True) pins the
+        cache object, and vLLM later balances that pin through lookup_unpin().
+        """
+        pinned_memory_obj_ids: set[int] = set()
+        if location != "LocalCPUBackend":
+            pass
+        elif req_id not in self.lookup_pins:
+            pass
+        elif location not in self.lookup_pins[req_id]:
+            pass
+        else:
+            assert self.storage_manager is not None
+            backend = self.storage_manager.storage_backends.get(location)
+            hot_cache = getattr(backend, "hot_cache", None)
+            cpu_lock = getattr(backend, "cpu_lock", None)
+            if hot_cache is None or cpu_lock is None:
+                pass
+            else:
+                with cpu_lock:
+                    for key in self.lookup_pins[req_id][location]:
+                        memory_obj = hot_cache.get(key)
+                        if memory_obj is None:
+                            pass
+                        else:
+                            pinned_memory_obj_ids.add(id(memory_obj))
+        return pinned_memory_obj_ids
 
     @_lmcache_nvtx_annotate
     def lookup(
