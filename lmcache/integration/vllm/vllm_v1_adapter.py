@@ -215,6 +215,22 @@ class LoadSpec:
     # decides reuse eligibility, while the worker later needs the same plan when
     # KV tensors and slot_mapping are available.
     putpocket_plan: Optional[dict[str, Any]] = None
+    # LMCache key namespace used for lookup/retrieve/store. Putpocket control
+    # metadata must not enter LMCache cache keys, so fixed requests carry a
+    # sanitized tag-only config here.
+    lmcache_request_configs: Optional[dict[str, Any]] = None
+
+
+def get_lmcache_request_configs_for_request(request: Any) -> Optional[dict[str, Any]]:
+    """Return the LMCache key configs for a tracked request lifecycle."""
+    load_spec = getattr(request, "load_spec", None)
+    if load_spec is None:
+        request_configs = request.request_configs
+    elif load_spec.lmcache_request_configs is None:
+        request_configs = request.request_configs
+    else:
+        request_configs = load_spec.lmcache_request_configs
+    return request_configs
 
 
 @dataclass
@@ -982,6 +998,7 @@ class LMCacheConnectorV1Impl:
             token_mask[:masked_token_count] = False
 
             lmcache_cached_tokens = request.load_spec.lmcache_cached_tokens
+            lmcache_request_configs = get_lmcache_request_configs_for_request(request)
             if self.use_layerwise:
                 if idx == last_idx:
                     sync = True
@@ -993,15 +1010,23 @@ class LMCacheConnectorV1Impl:
                     # LoadSpec; here vLLM has allocated slots and the worker
                     # can update/load real KV tensors.
                     assert self.putpocket_executor is not None
+                    setattr(self.lmcache_engine, "_putpocket_vllm_config", self._vllm_config)
                     handled_by_putpocket = self.putpocket_executor.apply_plan(
                         plan=request.load_spec.putpocket_plan,
                         lmcache_engine=self.lmcache_engine,
                         tokens=tokens[:lmcache_cached_tokens],
                         token_mask=token_mask[:lmcache_cached_tokens],
+                        prefix_tokens=tokens[:lmcache_cached_tokens],
+                        prefix_token_mask=token_mask[:lmcache_cached_tokens],
                         kvcaches=kvcaches,
                         slot_mapping=slot_mapping[:lmcache_cached_tokens],
+                        prefix_slot_mapping=slot_mapping[:lmcache_cached_tokens],
+                        full_tokens=tokens,
+                        full_token_mask=token_mask,
+                        full_slot_mapping=slot_mapping,
                         vllm_cached_tokens=request.load_spec.vllm_cached_tokens,
                         request_configs=request.request_configs,
+                        lmcache_request_configs=lmcache_request_configs,
                         req_id=request.req_id,
                         sync=sync,
                     )
@@ -1032,7 +1057,7 @@ class LMCacheConnectorV1Impl:
                         kvcaches=kvcaches,
                         slot_mapping=slot_mapping[:lmcache_cached_tokens],
                         vllm_cached_tokens=request.load_spec.vllm_cached_tokens,
-                        request_configs=request.request_configs,
+                        request_configs=lmcache_request_configs,
                         putpocket_disable_position_remap=(
                             self.putpocket_blending_mode
                             == PUTPOCKET_SPECIAL_BLENDING_MODE
@@ -1051,7 +1076,7 @@ class LMCacheConnectorV1Impl:
                     kvcaches=kvcaches,
                     slot_mapping=slot_mapping[:lmcache_cached_tokens],
                     vllm_cached_tokens=request.load_spec.vllm_cached_tokens,
-                    request_configs=request.request_configs,
+                    request_configs=lmcache_request_configs,
                     req_id=request.req_id,
                 )
 
@@ -1297,13 +1322,16 @@ class LMCacheConnectorV1Impl:
 
                 # TODO (Jiayi): need to make layerwise storing
                 # compatible with disagg spec
+                lmcache_request_configs = get_lmcache_request_configs_for_request(
+                    request
+                )
                 layerwise_storer = self.lmcache_engine.store_layer(
                     token_ids,
                     mask=store_mask,
                     kvcaches=kvcaches,
                     slot_mapping=slot_mapping,
                     offset=skip_leading_tokens,
-                    request_configs=request.request_configs,
+                    request_configs=lmcache_request_configs,
                     sync=is_first,
                     req_id=request.req_id,
                 )
@@ -1505,7 +1533,7 @@ class LMCacheConnectorV1Impl:
                 slot_mapping=slot_mapping,
                 offset=skip_leading_tokens,
                 transfer_spec=request.disagg_spec,
-                request_configs=request.request_configs,
+                request_configs=get_lmcache_request_configs_for_request(request),
                 req_id=request.req_id,
             )
 
@@ -1579,6 +1607,7 @@ class LMCacheConnectorV1Impl:
         # Putpocket needs more than a hit-token count, so this scheduler-side
         # plan is copied into LoadSpec for later worker-side execution.
         putpocket_plan = None
+        lmcache_request_configs = None
 
         if (
             num_external_hit_tokens := self.lookup_client.lookup_cache(lookup_id=req_id)
@@ -1591,6 +1620,7 @@ class LMCacheConnectorV1Impl:
             else:
                 num_external_hit_tokens = cached_load_spec.lmcache_cached_tokens
                 putpocket_plan = cached_load_spec.putpocket_plan
+                lmcache_request_configs = cached_load_spec.lmcache_request_configs
             logger.debug(
                 f"Found {num_external_hit_tokens} hit tokens for request"
                 f" {req_id} in the lookup cache."
@@ -1620,10 +1650,16 @@ class LMCacheConnectorV1Impl:
                 self.putpocket_blending_mode == PUTPOCKET_SPECIAL_BLENDING_MODE
                 and get_is_putpocket_request(request_configs)
             ):
+                assert self.putpocket_executor is not None
+                lmcache_request_configs = (
+                    self.putpocket_executor.get_fixed_lmcache_request_configs(
+                        request_configs=request_configs,
+                    )
+                )
                 exact_hit_tokens = self.lookup_client.lookup(
                     token_ids,
                     lookup_id=req_id,
-                    request_configs=request_configs,
+                    request_configs=lmcache_request_configs,
                 )
                 if exact_hit_tokens is None:
                     num_external_hit_tokens = None
@@ -1641,7 +1677,6 @@ class LMCacheConnectorV1Impl:
                     # Planning hook. No KV tensors are visible here; this can only
                     # estimate source reuse and produce a serializable plan from
                     # request metadata carried through request_configs.
-                    assert self.putpocket_executor is not None
                     putpocket_plan = (
                         self.putpocket_executor.build_plan_from_request_configs(
                             request_id=req_id,
@@ -1669,10 +1704,11 @@ class LMCacheConnectorV1Impl:
                             request.num_tokens,
                         )
             else:
+                lmcache_request_configs = request_configs
                 num_external_hit_tokens = self.lookup_client.lookup(
                     token_ids,
                     lookup_id=req_id,
-                    request_configs=request_configs,
+                    request_configs=lmcache_request_configs,
                 )
 
         if num_external_hit_tokens is None:
@@ -1732,6 +1768,7 @@ class LMCacheConnectorV1Impl:
             lmcache_cached_tokens=num_external_hit_tokens,
             can_load=False,
             putpocket_plan=putpocket_plan,
+            lmcache_request_configs=lmcache_request_configs,
         )
 
         if below_min_retrieve or need_to_allocate <= 0:

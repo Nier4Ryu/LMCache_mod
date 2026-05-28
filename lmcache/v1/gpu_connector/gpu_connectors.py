@@ -787,6 +787,15 @@ class VLLMBufferLayerwiseGPUConnector(GPUConnectorInterface):
 
         self._lazy_initialize_buffer(self.kvcaches)
 
+        if "putpocket_source_to_target_spans" in kwargs:
+            yield from self._batched_to_gpu_putpocket_remap(
+                starts=starts,
+                ends=ends,
+                slot_mapping=slot_mapping,
+                **kwargs,
+            )
+            return
+
         num_all_tokens = ends[-1] - starts[0]
         slot_mapping_full = slot_mapping[starts[0] : ends[-1]]
 
@@ -907,6 +916,193 @@ class VLLMBufferLayerwiseGPUConnector(GPUConnectorInterface):
         )
 
         yield
+
+    def _batched_to_gpu_putpocket_remap(
+        self,
+        starts: List[int],
+        ends: List[int],
+        slot_mapping: torch.Tensor,
+        **kwargs,
+    ):
+        """Load source spans into target slots with runtime-vLLM RoPE remap."""
+        source_to_target_spans = kwargs["putpocket_source_to_target_spans"]
+        reusable_token_count = sum(
+            int(span["target_end"]) - int(span["target_start"])
+            for span in source_to_target_spans
+        )
+        if reusable_token_count <= 0:
+            raise ValueError("Putpocket remap requires at least one reusable token")
+
+        target_slot_mapping, old_positions, new_positions = (
+            self._get_putpocket_remap_tensors(
+                source_to_target_spans=source_to_target_spans,
+                slot_mapping=slot_mapping,
+            )
+        )
+        rotary_emb = self._get_putpocket_runtime_rotary_emb(kwargs)
+
+        buffer_shape = self.get_shape(reusable_token_count)
+        assert self.gpu_buffer_allocator is not None
+        remap_gpu_buffer_obj = self.gpu_buffer_allocator.allocate(
+            buffer_shape, self.dtype, MemoryFormat.KV_2TD
+        )
+        assert remap_gpu_buffer_obj is not None, (
+            "Failed to allocate Putpocket remap GPU buffer"
+        )
+        assert remap_gpu_buffer_obj.tensor is not None
+
+        for layer_id in range(self.num_layers):
+            memory_objs_layer = yield
+            if memory_objs_layer is None:
+                raise RuntimeError("Putpocket source KV remap missed source layer data")
+
+            self._fill_putpocket_remap_buffer(
+                remap_buffer=remap_gpu_buffer_obj.tensor,
+                source_to_target_spans=source_to_target_spans,
+                starts=starts,
+                ends=ends,
+                memory_objs_layer=memory_objs_layer,
+            )
+            self._apply_putpocket_rope_remap(
+                remap_buffer=remap_gpu_buffer_obj.tensor,
+                old_positions=old_positions,
+                new_positions=new_positions,
+                rotary_emb=rotary_emb,
+            )
+            lmc_ops.single_layer_kv_transfer(
+                remap_gpu_buffer_obj.tensor,
+                self.kvcaches[layer_id],
+                target_slot_mapping,
+                lmc_ops.TransferDirection.H2D,
+                self.gpu_kv_format,
+                token_major=False,
+            )
+
+        yield
+        remap_gpu_buffer_obj.ref_count_down()
+        yield
+
+    def _get_putpocket_remap_tensors(
+        self,
+        source_to_target_spans,
+        slot_mapping: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Build compact target slots and source/target position tensors."""
+        target_slot_mapping_chunks = []
+        old_position_chunks = []
+        new_position_chunks = []
+        device = slot_mapping.device
+        for span in source_to_target_spans:
+            source_start = int(span["source_start"])
+            source_end = int(span["source_end"])
+            target_start = int(span["target_start"])
+            target_end = int(span["target_end"])
+            if source_end - source_start != target_end - target_start:
+                raise ValueError(
+                    "Putpocket reusable source and target spans must have "
+                    "the same token length"
+                )
+            else:
+                pass
+
+            target_slot_mapping_chunks.append(slot_mapping[target_start:target_end])
+            old_position_chunks.append(
+                torch.arange(source_start, source_end, dtype=torch.int64, device=device)
+            )
+            new_position_chunks.append(
+                torch.arange(target_start, target_end, dtype=torch.int64, device=device)
+            )
+
+        target_slot_mapping = torch.cat(target_slot_mapping_chunks, dim=0)
+        old_positions = torch.cat(old_position_chunks, dim=0)
+        new_positions = torch.cat(new_position_chunks, dim=0)
+        return target_slot_mapping, old_positions, new_positions
+
+    def _get_putpocket_runtime_rotary_emb(self, kwargs):
+        """Return the vLLM runtime rotary object used by the active model."""
+        rotary_emb = kwargs.get("putpocket_rotary_emb")
+        if rotary_emb is None:
+            from lmcache.integration.vllm.utils import ENGINE_NAME
+
+            layerwise_model = LMCBlenderBuilder.get(ENGINE_NAME).layerwise_model
+            rotary_emb = layerwise_model.vllm_model.model.layers[0].self_attn.rotary_emb
+        else:
+            pass
+        return rotary_emb
+
+    def _fill_putpocket_remap_buffer(
+        self,
+        remap_buffer: torch.Tensor,
+        source_to_target_spans,
+        starts: List[int],
+        ends: List[int],
+        memory_objs_layer,
+    ) -> None:
+        """Compact reusable source KV spans into a temporary GPU buffer."""
+        write_start = 0
+        for span in source_to_target_spans:
+            source_start = int(span["source_start"])
+            source_end = int(span["source_end"])
+            span_token_count = source_end - source_start
+            write_end = write_start + span_token_count
+            span_write_index = write_start
+            for chunk_start, chunk_end, memory_obj in zip(
+                starts,
+                ends,
+                memory_objs_layer,
+                strict=False,
+            ):
+                overlap_start = max(source_start, chunk_start)
+                overlap_end = min(source_end, chunk_end)
+                if overlap_start < overlap_end:
+                    assert memory_obj.metadata.fmt == MemoryFormat.KV_2TD
+                    assert memory_obj.tensor is not None
+                    chunk_read_start = overlap_start - chunk_start
+                    chunk_read_end = overlap_end - chunk_start
+                    chunk_token_count = overlap_end - overlap_start
+                    span_write_end = span_write_index + chunk_token_count
+                    remap_buffer[0][span_write_index:span_write_end].copy_(
+                        memory_obj.tensor[0][chunk_read_start:chunk_read_end]
+                    )
+                    remap_buffer[1][span_write_index:span_write_end].copy_(
+                        memory_obj.tensor[1][chunk_read_start:chunk_read_end]
+                    )
+                    span_write_index = span_write_end
+                else:
+                    pass
+            if span_write_index != write_end:
+                raise RuntimeError(
+                    "Putpocket source KV remap could not cover a reusable span"
+                )
+            else:
+                pass
+            write_start = write_end
+
+    def _apply_putpocket_rope_remap(
+        self,
+        remap_buffer: torch.Tensor,
+        old_positions: torch.Tensor,
+        new_positions: torch.Tensor,
+        rotary_emb,
+    ) -> None:
+        """Apply old-position to new-position RoPE correction to K only."""
+        if torch.equal(old_positions, new_positions):
+            pass
+        else:
+            key = remap_buffer[0].view(
+                old_positions.shape[0],
+                -1,
+                rotary_emb.head_size,
+            )
+            cos_sin_cache = rotary_emb._match_cos_sin_cache_dtype(remap_buffer[0])
+            lmc_ops.rotary_embedding_k_fused(
+                old_positions,
+                new_positions,
+                key,
+                rotary_emb.head_size,
+                cos_sin_cache,
+                rotary_emb.is_neox_style,
+            )
 
     # TODO(Jiayi): Reduce repetitive operations in `batched_to_gpu`
     # and `batched_from_gpu`.
